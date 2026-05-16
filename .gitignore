@@ -1,0 +1,18 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+
+# Arduino
+*.elf
+*.bin
+*.hex
+*.map
+build/
+.vscode/
+
+# Libraries (optional - remove if you want to track libraries)
+# libraries/
