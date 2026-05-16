@@ -228,3 +228,22 @@ Both sketches have compile-time boolean flags at the top to enable/disable verbo
 |---|---|
 | `gateway_n2k` | `1.0.2` |
 | `gateway_n2k_simulation` | `1.0.2-sim` |
+
+---
+
+## Development Workflow
+
+This repository is managed with Git. After making changes to sketches or other files, commit and push using VS Code's built-in Source Control panel or the terminal:
+
+```bash
+# Stage all changes
+git add .
+
+# Commit with a descriptive message
+git commit -m "Your change description here"
+
+# Push to GitHub
+git push
+```
+
+In VS Code, changed files appear in the **Source Control** sidebar (the branch icon). You can stage, commit, and push directly from there without using the terminal.
