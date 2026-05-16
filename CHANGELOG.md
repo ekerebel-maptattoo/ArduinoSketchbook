@@ -193,6 +193,125 @@ struct SimAisTarget {
 
 ---
 
+## gateway_n2k_simulation — 1.0.5-sim
+
+### Change 5 — Single fixed AIS source address (SRC_AIS_RECEIVER)
+
+**Why:** The simulator was using `SRC_AIS_BASE + i` (one unique N2K source
+address per simulated vessel). In NMEA 2000, the source address identifies
+the **talker device on the bus** (the AIS receiver), not the individual vessel.
+Vessels are distinguished by the MMSI bytes in the payload. Using a per-target
+SRC caused the MAPTATTOO receiver to create a separate `(source, pgn)` map
+entry per vessel, and also inflated the `lastTxMs` throttle map unnecessarily.
+
+**What changed:**
+
+Removed `SRC_AIS_BASE = 0x40`. Added:
+```cpp
+// Fixed N2K source address for ALL AIS PGNs — identifies the AIS receiver
+// device on the bus, not the individual vessel.
+static const uint8_t SRC_AIS_RECEIVER = 0x01;
+```
+
+All `notifyPGN()` calls in `simulateAisRealistic()` now pass `SRC_AIS_RECEIVER`
+instead of `SRC_AIS_BASE + i`. The `src` local variable was removed.
+
+**Port to gateway_n2k:** Not applicable. The production gateway correctly uses
+the actual N2K source address decoded from the CAN frame (from `decodeId()`),
+which on a real bus is the single AIS receiver device's address for all targets.
+This bug was introduced by the simulator's artificial per-target SRC assignment.
+
+---
+
+### Change 6 — AIS inter-frame pacing (AIS_MIN_INTER_FRAME_MS)
+
+**Why:** Two or more AIS targets whose dynamic report intervals expire on the
+same `loop()` tick would fire `notifyPGN()` back-to-back with < 1 ms between
+them. The MAPTATTOO receiver's 10 ms duplicate dedup filter was dropping the
+second notification as a presumed BlueZ duplicate — even though the payloads
+contained different MMSIs. Confirmed by log analysis showing callbacks 9 ms
+apart for MMSI 367100007 and 367100008 with the second one filtered.
+
+**What was added:**
+
+```cpp
+static const uint32_t AIS_MIN_INTER_FRAME_MS = 25u;  // > 10 ms dedup window
+static uint32_t       gLastAisNotifyMs       = 0;
+```
+
+In `simulateAisRealistic()`, before updating `gAisLastDynMs[i]` or calling
+`notifyPGN()`, the code checks:
+```cpp
+if (nowMs - gLastAisNotifyMs < AIS_MIN_INTER_FRAME_MS) {
+    // skip this target this tick — will be picked up next loop()
+} else {
+    gAisLastDynMs[i] = nowMs;
+    gLastAisNotifyMs = nowMs;
+    // ... build and send ...
+}
+```
+
+`gAisLastDynMs[i]` is NOT updated when skipping, so the target is retried on
+the very next `loop()` iteration (typically < 1 ms later in practice, but with
+`gLastAisNotifyMs` now ≥ 25 ms behind, the next target will be allowed through).
+
+The same guard is applied to the static/voyage data block and the AtoN block.
+
+**Port to gateway_n2k:** The production gateway receives frames from the N2K
+bus at hardware-limited rates (~0.5 ms per CAN frame minimum). In practice, two
+AIS messages from a single AIS receiver arrive with at least the TDMA slot gap
+(~26.67 ms). No inter-frame pacing is needed in the production gateway. This
+change is simulator-only.
+
+**Memorized for later — Change 7 (not yet implemented):**
+Batch multiple AIS targets into a single BLE notification using the receiver's
+`parseMultipleAISTargets()` which walks the payload in 18-byte strides. One
+`notifyPGN()` call per loop tick carrying N × 18 bytes, immune to BlueZ/kernel
+coalescing. Requires coordination with MAPTATTOO app to confirm stride size.
+
+---
+
+## gateway_n2k_simulation — 1.0.6-sim
+
+### Change 8 — Fix AIS dynamic payload field order and SOG units
+
+**Why:** Log analysis showed AIS targets appearing at the correct MMSI but with
+lat/lon swapped and wildly wrong SOG (e.g. 841 kts instead of 9 kts). Root cause
+was a wrong field layout in `buildAISDynamic()` used by PGN 129038/129039/129040.
+
+**Three bugs fixed in `buildAISDynamic()`:**
+
+1. **LON/LAT swap** — Simulator was sending lat at bytes 5-8 and lon at bytes
+   9-12. PGN 129038 standard: **lon first, lat second**.
+
+2. **COG/SOG order** — Simulator was sending SOG at bytes 13-14 and COG at
+   bytes 15-16. Standard: **COG first (bytes 13-14), SOG second (bytes 15-16)**.
+
+3. **SOG units** — Simulator used `speedCms()` (m/s × 100). PGN 129038 SOG
+   field is **0.01 knots** (centikts). New helper `speedCentikts()` added.
+
+Correct layout after fix:
+```
+byte 0:       message ID (0x00)
+bytes  1-4:   MMSI (u32le)
+bytes  5-8:   LON × 1e7 (i32le)
+bytes  9-12:  LAT × 1e7 (i32le)
+bytes 13-14:  COG (u16le, 1e-4 rad)
+bytes 15-16:  SOG (u16le, 0.01 knots)
+bytes 17-18:  Heading (u16le, 1e-4 rad)
+bytes 19-20:  ROT = 0x7FFF
+bytes 21-23:  0xFF padding
+```
+
+**Port to gateway_n2k: NOT REQUIRED.**
+The production gateway forwards raw N2K PGN payloads directly from the CAN bus
+without constructing them. The AIS receiver on the N2K bus sends correctly
+formatted PGN 129038/129039/129040 frames — the gateway just passes them through
+via `notifyPGN()`. These bugs were introduced only in the simulator's synthetic
+payload builders and do not exist in the production firmware.
+
+---
+
 ## gateway_n2k — 1.0.2 (production, unchanged)
 
 No changes have been made to the production gateway firmware yet.

@@ -61,7 +61,7 @@ static const uint32_t LED_PWM_FREQ = 5000;
 static const uint8_t  LED_PWM_RES  = 8;
 
 // -------- Firmware identity --------
-static const char* FW_VERSION = "1.0.4-sim";
+static const char* FW_VERSION = "1.0.6-sim";
 
 // -------- BLE --------
 static std::string gBleName;
@@ -80,7 +80,7 @@ static const uint8_t SRC_GATEWAY = 0xFF;
 // When a new BLE client connects, pause all data notifications for this long
 // to give it time to complete service discovery and subscribe to characteristics
 // without being flooded by notifications during setup.
-static const uint32_t CONNECT_PAUSE_MS      = 2000;
+static const uint32_t CONNECT_PAUSE_MS      = 15000;
 static uint32_t       gConnectingPauseUntilMs = 0;
 
 static inline bool isConnectPaused(uint32_t nowMs) {
@@ -90,7 +90,10 @@ static inline bool isConnectPaused(uint32_t nowMs) {
 static const uint8_t SRC_OWNSHIP_NAV    = 0x23;
 static const uint8_t SRC_OWNSHIP_ENV    = 0x24;
 static const uint8_t SRC_OWNSHIP_ENGINE = 0x25;
-static const uint8_t SRC_AIS_BASE       = 0x40;
+// SRC_AIS_RECEIVER: fixed N2K source address used for ALL simulated AIS PGNs.
+// On a real N2K bus, the source address identifies the AIS receiver device,
+// not the individual vessel — vessels are distinguished by MMSI in the payload.
+static const uint8_t SRC_AIS_RECEIVER   = 0x01;
 
 // -------- Debug counters --------
 static uint32_t gSimFramesGenerated  = 0;
@@ -204,6 +207,14 @@ static int16_t signedRad1e4(double deg) {
 
 static uint16_t speedCms(double knots) {
   long val = lround(knots * KNOT_TO_MPS * 100.0);
+  if (val < 0) val = 0;
+  if (val > 65534) val = 65534;
+  return (uint16_t)val;
+}
+
+// PGN 129038/129039/129040 SOG field: 0.01 knots resolution (centikts)
+static uint16_t speedCentikts(double knots) {
+  long val = lround(knots * 100.0);
   if (val < 0) val = 0;
   if (val > 65534) val = 65534;
   return (uint16_t)val;
@@ -778,14 +789,14 @@ static void appendFixedText(std::vector<uint8_t>& p, const char* s, size_t width
 static std::vector<uint8_t> buildAISDynamic(uint32_t mmsi, double latDeg, double lonDeg,
                                              double cogDeg, double sogKt, double hdgDeg) {
   std::vector<uint8_t> p;
-  appendU8(p, 0x00);
-  appendU32LE(p, mmsi);
-  appendI32LE(p, (int32_t)llround(latDeg * 1e7));
-  appendI32LE(p, (int32_t)llround(lonDeg * 1e7));
-  appendU16LE(p, speedCms(sogKt));
-  appendU16LE(p, rad1e4(cogDeg));
-  appendU16LE(p, rad1e4(hdgDeg));
-  appendI16LE(p, 0x7FFF);
+  appendU8(p, 0x00);                                        // message ID
+  appendU32LE(p, mmsi);                                     // MMSI
+  appendI32LE(p, (int32_t)llround(lonDeg * 1e7));          // LON first (PGN 129038 standard)
+  appendI32LE(p, (int32_t)llround(latDeg * 1e7));          // LAT second
+  appendU16LE(p, rad1e4(cogDeg));                           // COG before SOG
+  appendU16LE(p, speedCentikts(sogKt));                     // SOG in 0.01 knots (centikts)
+  appendU16LE(p, rad1e4(hdgDeg));                           // Heading
+  appendI16LE(p, 0x7FFF);                                   // ROT unavailable
   appendU8(p, 0xFF); appendU8(p, 0xFF); appendU8(p, 0xFF);
   return p;
 }
@@ -921,6 +932,13 @@ static SimAisTarget gAisTargets[15] = {
 static uint32_t gAisLastDynMs[15]    = {};
 static uint32_t gAisLastStaticMs[15] = {};
 
+// Minimum gap between any two successive AIS BLE notifications.
+// Prevents back-to-back notifications (two targets whose intervals expire on
+// the same loop() tick) from triggering the receiver's duplicate filter.
+// 25 ms >> 10 ms dedup window; well below the 2 s minimum real AIS interval.
+static const uint32_t AIS_MIN_INTER_FRAME_MS = 25u;
+static uint32_t       gLastAisNotifyMs       = 0;
+
 // Realistic dynamic report interval per ITU-R M.1371 / IEC 62287.
 // Class A: 2 s (>23 kt), 6 s (14-23 kt), 10 s (0-14 kt), 180 s (<2 kt)
 // Class B: 15 s (>14 kt), 30 s (2-14 kt), 180 s (<2 kt)
@@ -955,17 +973,19 @@ static void simulateAisRealistic(uint32_t nowMs) {
   const double tSec = (nowMs - gSimStartMs) / 1000.0;
 
   for (uint8_t i = 0; i < 15; ++i) {
-    SimAisTarget& a  = gAisTargets[i];
-    const uint8_t src = SRC_AIS_BASE + i;
+    SimAisTarget& a = gAisTargets[i];
 
     // ---- AtoN (target 12): every 3 minutes ----
     if (i == 12) {
       if (nowMs - gAisLastDynMs[i] >= 180000u) {
-        gAisLastDynMs[i] = nowMs;
-        std::vector<uint8_t> p = buildAtoN(a.mmsi, a.lat0, a.lon0);
-        notifyPGN(129041, src, p.data(), p.size(), true);
-        gSimFramesGenerated++;
-        gLastN2KRxMs = nowMs;
+        if (nowMs - gLastAisNotifyMs >= AIS_MIN_INTER_FRAME_MS) {
+          gAisLastDynMs[i] = nowMs;
+          gLastAisNotifyMs = nowMs;
+          std::vector<uint8_t> p = buildAtoN(a.mmsi, a.lat0, a.lon0);
+          notifyPGN(129041, SRC_AIS_RECEIVER, p.data(), p.size(), true);
+          gSimFramesGenerated++;
+          gLastN2KRxMs = nowMs;
+        }
       }
       continue;
     }
@@ -973,53 +993,66 @@ static void simulateAisRealistic(uint32_t nowMs) {
     // ---- Dynamic position report ----
     const uint32_t dynInterval = aisDynIntervalMs(a);
     if (nowMs - gAisLastDynMs[i] >= dynInterval) {
-      gAisLastDynMs[i] = nowMs;
+      // Inter-frame pacing: don't send if another AIS notification went out
+      // less than AIS_MIN_INTER_FRAME_MS ago. Leave gAisLastDynMs[i] unchanged
+      // so this target is retried on the next loop() iteration.
+      if (nowMs - gLastAisNotifyMs < AIS_MIN_INTER_FRAME_MS) {
+        // skip this target this tick — will be picked up next loop
+      } else {
+        gAisLastDynMs[i] = nowMs;
+        gLastAisNotifyMs = nowMs;
 
-      double lat = a.lat0, lon = a.lon0;
-      double cog = wrap360(a.cogDeg + oscillate(0.0, 3.0, 75.0 + i * 3.0, (double)i, tSec));
-      double sog = a.sogKt + oscillate(0.0, 0.4, 50.0 + i * 2.0, i * 0.7, tSec);
-      if (sog < 0.0) sog = 0.0;
-      if (sog > 0.3) {
-        const double distM = sog * KNOT_TO_MPS * tSec;
-        movePoint(a.lat0, a.lon0, cog, distM, lat, lon);
-      }
-      const double hdg    = wrap360(cog + oscillate(0.0, 2.0, 21.0, (double)i, tSec));
-      const uint32_t dynPgn = a.classA ? 129038 : 129039;
+        double lat = a.lat0, lon = a.lon0;
+        double cog = wrap360(a.cogDeg + oscillate(0.0, 3.0, 75.0 + i * 3.0, (double)i, tSec));
+        double sog = a.sogKt + oscillate(0.0, 0.4, 50.0 + i * 2.0, i * 0.7, tSec);
+        if (sog < 0.0) sog = 0.0;
+        if (sog > 0.3) {
+          const double distM = sog * KNOT_TO_MPS * tSec;
+          movePoint(a.lat0, a.lon0, cog, distM, lat, lon);
+        }
+        const double hdg    = wrap360(cog + oscillate(0.0, 2.0, 21.0, (double)i, tSec));
+        const uint32_t dynPgn = a.classA ? 129038 : 129039;
 
-      std::vector<uint8_t> p = buildAISDynamic(a.mmsi, lat, lon, cog, sog, hdg);
-      notifyPGN(dynPgn, src, p.data(), p.size(), true);
-      gSimFramesGenerated++;
-
-      if (!a.classA && (i % 4 == 0)) {
-        p = buildAISDynamic(a.mmsi, lat, lon, cog, sog, cog);
-        notifyPGN(129040, src, p.data(), p.size(), true);
+        std::vector<uint8_t> p = buildAISDynamic(a.mmsi, lat, lon, cog, sog, hdg);
+        notifyPGN(dynPgn, SRC_AIS_RECEIVER, p.data(), p.size(), true);
         gSimFramesGenerated++;
+
+        if (!a.classA && (i % 4 == 0)) {
+          p = buildAISDynamic(a.mmsi, lat, lon, cog, sog, cog);
+          notifyPGN(129040, SRC_AIS_RECEIVER, p.data(), p.size(), true);
+          gSimFramesGenerated++;
+        }
+        gLastN2KRxMs = nowMs;
       }
-      gLastN2KRxMs = nowMs;
     }
 
     // ---- Static / voyage data (every 6 minutes) ----
     if (nowMs - gAisLastStaticMs[i] >= AIS_STATIC_INTERVAL_MS) {
-      gAisLastStaticMs[i] = nowMs;
-      std::vector<uint8_t> p;
-      if (a.classA) {
-        p = buildAISClassAStaticVoyage(a.mmsi, a.name, a.shipType);
-        notifyPGN(129794, src, p.data(), p.size(), true);
-        gSimFramesGenerated++;
+      if (nowMs - gLastAisNotifyMs < AIS_MIN_INTER_FRAME_MS) {
+        // skip this tick — will be picked up next loop
       } else {
-        p = buildAISClassBStaticA(a.mmsi, a.name);
-        notifyPGN(129809, src, p.data(), p.size(), true);
-        gSimFramesGenerated++;
-        p = buildAISClassBStaticB(a.mmsi, a.shipType);
-        notifyPGN(129810, src, p.data(), p.size(), true);
-        gSimFramesGenerated++;
+        gAisLastStaticMs[i] = nowMs;
+        gLastAisNotifyMs = nowMs;
+        std::vector<uint8_t> p;
+        if (a.classA) {
+          p = buildAISClassAStaticVoyage(a.mmsi, a.name, a.shipType);
+          notifyPGN(129794, SRC_AIS_RECEIVER, p.data(), p.size(), true);
+          gSimFramesGenerated++;
+        } else {
+          p = buildAISClassBStaticA(a.mmsi, a.name);
+          notifyPGN(129809, SRC_AIS_RECEIVER, p.data(), p.size(), true);
+          gSimFramesGenerated++;
+          p = buildAISClassBStaticB(a.mmsi, a.shipType);
+          notifyPGN(129810, SRC_AIS_RECEIVER, p.data(), p.size(), true);
+          gSimFramesGenerated++;
+        }
+        if (i % 5 == 0) {
+          p = buildAISUtcDate(a.mmsi);
+          notifyPGN(129793, SRC_AIS_RECEIVER, p.data(), p.size(), true);
+          gSimFramesGenerated++;
+        }
+        gLastN2KRxMs = nowMs;
       }
-      if (i % 5 == 0) {
-        p = buildAISUtcDate(a.mmsi);
-        notifyPGN(129793, src, p.data(), p.size(), true);
-        gSimFramesGenerated++;
-      }
-      gLastN2KRxMs = nowMs;
     }
   }
 }
