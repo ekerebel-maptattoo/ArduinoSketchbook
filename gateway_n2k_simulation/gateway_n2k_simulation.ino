@@ -61,7 +61,8 @@ static const uint32_t LED_PWM_FREQ = 5000;
 static const uint8_t  LED_PWM_RES  = 8;
 
 // -------- Firmware identity --------
-static const char* FW_VERSION = "1.0.8-sim";
+// r2: SOG encoding corrected — 0.01 m/s (speedCms) instead of 0.01 kts (speedCentikts)
+static const char* FW_VERSION = "1.0.6-sim-r2";
 
 // -------- BLE --------
 static std::string gBleName;
@@ -205,16 +206,9 @@ static int16_t signedRad1e4(double deg) {
   return (int16_t)val;
 }
 
+// Speed in 0.01 m/s (cm/s) — used for AIS SOG and all other N2K speed fields
 static uint16_t speedCms(double knots) {
   long val = lround(knots * KNOT_TO_MPS * 100.0);
-  if (val < 0) val = 0;
-  if (val > 65534) val = 65534;
-  return (uint16_t)val;
-}
-
-// PGN 129038/129039/129040 SOG field: 0.01 knots resolution (centikts)
-static uint16_t speedCentikts(double knots) {
-  long val = lround(knots * 100.0);
   if (val < 0) val = 0;
   if (val > 65534) val = 65534;
   return (uint16_t)val;
@@ -779,19 +773,6 @@ static std::vector<uint8_t> buildPGN129029_GNSS(double latDeg, double lonDeg, do
   return p;
 }
 
-// -------- N2K bit-packing helper --------
-// N2K uses LSB-first bit ordering within bytes (little-endian bit stream).
-// Sets numBits of value starting at startBit in buf.
-static void n2kSetBits(uint8_t* buf, int startBit, int numBits, uint64_t value) {
-  for (int i = 0; i < numBits; ++i) {
-    int pos = startBit + i;
-    if (value & (1ULL << i))
-      buf[pos >> 3] |=  (uint8_t)(1u << (pos & 7));
-    else
-      buf[pos >> 3] &= ~(uint8_t)(1u << (pos & 7));
-  }
-}
-
 // -------- AIS payload builders --------
 
 static void appendFixedText(std::vector<uint8_t>& p, const char* s, size_t width) {
@@ -799,53 +780,19 @@ static void appendFixedText(std::vector<uint8_t>& p, const char* s, size_t width
   for (size_t i = 0; i < width; ++i) p.push_back((uint8_t)((i < n) ? s[i] : ' '));
 }
 
-// PGN 129038 — AIS Class A Position Report (26 bytes, bit-packed per N2K standard)
-// Field bit offsets from canboat pgns.xml:
-//   0: MsgID(6)  6: Repeat(2)  8: MMSI(30)  38: NavStatus(4)
-//  42: ROT(16)  58: SOG(16,0.01kts)  74: PosAcc(1)
-//  75: LON(32,1e-7deg)  107: LAT(32,1e-7deg)
-// 139: COG(16,1e-4rad)  155: HDG(16,1e-4rad)  171: TimeStamp(6)
-static std::vector<uint8_t> buildAISClassADynamic(uint32_t mmsi, double latDeg, double lonDeg,
-                                                   double cogDeg, double sogKt, double hdgDeg) {
-  uint8_t buf[26] = {};
-  n2kSetBits(buf,   0,  6, 1);                                              // Message ID = 1
-  n2kSetBits(buf,   6,  2, 0);                                              // Repeat = 0
-  n2kSetBits(buf,   8, 30, (uint64_t)mmsi);                                 // MMSI
-  n2kSetBits(buf,  38,  4, 0);                                              // Nav Status = 0
-  n2kSetBits(buf,  42, 16, (uint64_t)(uint16_t)0x8000);                    // ROT = N/A
-  // SOG: 0.01 m/s units (cm/s) — the app decodes as m/s * 0.01, then converts to kts
-  n2kSetBits(buf,  58, 16, (uint64_t)(uint16_t)std::min(65534L, lround(sogKt * KNOT_TO_MPS * 100.0)));
-  n2kSetBits(buf,  74,  1, 0);                                              // Pos Accuracy = 0
-  n2kSetBits(buf,  75, 32, (uint64_t)(uint32_t)(int32_t)llround(lonDeg * 1e7));
-  n2kSetBits(buf, 107, 32, (uint64_t)(uint32_t)(int32_t)llround(latDeg * 1e7));
-  n2kSetBits(buf, 139, 16, (uint64_t)(uint16_t)std::min(62831L, lround(degToRad(cogDeg) * 10000.0)));
-  n2kSetBits(buf, 155, 16, (uint64_t)(uint16_t)std::min(62831L, lround(degToRad(hdgDeg) * 10000.0)));
-  n2kSetBits(buf, 171,  6, 60);                                             // Time Stamp = N/A
-  return std::vector<uint8_t>(buf, buf + 26);
-}
-
-// PGN 129039 — AIS Class B Position Report (26 bytes, bit-packed per N2K standard)
-// Field bit offsets:
-//   0: MsgID(6)  6: Repeat(2)  8: MMSI(30)  38: Reserved(8)
-//  46: SOG(16,0.01kts)  62: PosAcc(1)
-//  63: LON(32,1e-7deg)  95: LAT(32,1e-7deg)
-// 127: COG(16,1e-4rad)  143: HDG(16,1e-4rad)  159: TimeStamp(6)
-static std::vector<uint8_t> buildAISClassBDynamic(uint32_t mmsi, double latDeg, double lonDeg,
-                                                   double cogDeg, double sogKt, double hdgDeg) {
-  uint8_t buf[26] = {};
-  n2kSetBits(buf,   0,  6, 18);                                             // Message ID = 18
-  n2kSetBits(buf,   6,  2, 0);                                              // Repeat = 0
-  n2kSetBits(buf,   8, 30, (uint64_t)mmsi);                                 // MMSI
-  n2kSetBits(buf,  38,  8, 0);                                              // Reserved
-  // SOG: 0.01 m/s units (cm/s)
-  n2kSetBits(buf,  46, 16, (uint64_t)(uint16_t)std::min(65534L, lround(sogKt * KNOT_TO_MPS * 100.0)));
-  n2kSetBits(buf,  62,  1, 0);                                              // Pos Accuracy = 0
-  n2kSetBits(buf,  63, 32, (uint64_t)(uint32_t)(int32_t)llround(lonDeg * 1e7));
-  n2kSetBits(buf,  95, 32, (uint64_t)(uint32_t)(int32_t)llround(latDeg * 1e7));
-  n2kSetBits(buf, 127, 16, (uint64_t)(uint16_t)std::min(62831L, lround(degToRad(cogDeg) * 10000.0)));
-  n2kSetBits(buf, 143, 16, (uint64_t)(uint16_t)std::min(62831L, lround(degToRad(hdgDeg) * 10000.0)));
-  n2kSetBits(buf, 159,  6, 60);                                             // Time Stamp = N/A
-  return std::vector<uint8_t>(buf, buf + 26);
+static std::vector<uint8_t> buildAISDynamic(uint32_t mmsi, double latDeg, double lonDeg,
+                                             double cogDeg, double sogKt, double hdgDeg) {
+  std::vector<uint8_t> p;
+  appendU8(p, 0x00);                                        // message ID
+  appendU32LE(p, mmsi);                                     // MMSI
+  appendI32LE(p, (int32_t)llround(lonDeg * 1e7));          // LON first
+  appendI32LE(p, (int32_t)llround(latDeg * 1e7));          // LAT second
+  appendU16LE(p, rad1e4(cogDeg));                           // COG
+  appendU16LE(p, speedCms(sogKt));                          // SOG in 0.01 m/s (fixed from centikts)
+  appendU16LE(p, rad1e4(hdgDeg));                           // Heading
+  appendI16LE(p, 0x7FFF);                                   // ROT unavailable
+  appendU8(p, 0xFF); appendU8(p, 0xFF); appendU8(p, 0xFF);
+  return p;
 }
 
 static std::vector<uint8_t> buildAISClassBStaticA(uint32_t mmsi, const char* name) {
@@ -1058,18 +1005,14 @@ static void simulateAisRealistic(uint32_t nowMs) {
           movePoint(a.lat0, a.lon0, cog, distM, lat, lon);
         }
         const double hdg    = wrap360(cog + oscillate(0.0, 2.0, 21.0, (double)i, tSec));
-        std::vector<uint8_t> p;
-        if (a.classA) {
-          p = buildAISClassADynamic(a.mmsi, lat, lon, cog, sog, hdg);
-          notifyPGN(129038, SRC_AIS_RECEIVER, p.data(), p.size(), true);
-        } else {
-          p = buildAISClassBDynamic(a.mmsi, lat, lon, cog, sog, hdg);
-          notifyPGN(129039, SRC_AIS_RECEIVER, p.data(), p.size(), true);
-        }
+        const uint32_t dynPgn = a.classA ? 129038 : 129039;
+
+        std::vector<uint8_t> p = buildAISDynamic(a.mmsi, lat, lon, cog, sog, hdg);
+        notifyPGN(dynPgn, SRC_AIS_RECEIVER, p.data(), p.size(), true);
         gSimFramesGenerated++;
 
         if (!a.classA && (i % 4 == 0)) {
-          p = buildAISClassBDynamic(a.mmsi, lat, lon, cog, sog, cog);
+          p = buildAISDynamic(a.mmsi, lat, lon, cog, sog, cog);
           notifyPGN(129040, SRC_AIS_RECEIVER, p.data(), p.size(), true);
           gSimFramesGenerated++;
         }
@@ -1169,9 +1112,10 @@ void loop() {
   printHeap_60s(now);
   notifyRSSI_1Hz(now);
 
-  // Only generate and push data when at least one client is connected.
-  // No point building payloads or attempting notifies when nobody is listening.
-  if (isBleConnected()) {
+  // Only generate and push data when at least one client is connected
+  // and the connect pause has expired (so timestamps are not consumed
+  // while notifyPGN would silently drop the data).
+  if (isBleConnected() && !isConnectPaused(now)) {
     simulateOwnship1Hz(now);
     simulateAisRealistic(now);
   }
