@@ -66,7 +66,7 @@ static const uint32_t LED_PWM_FREQ = 5000;
 static const uint8_t  LED_PWM_RES  = 8;   // 8-bit => 0..255
 
 // -------- Firmware identity --------
-static const char* FW_VERSION = "1.0.2";
+static const char* FW_VERSION = "1.0.3";
 
 // -------- BLE --------
 static std::string gBleName;  // built at runtime
@@ -86,6 +86,19 @@ static const uint8_t MAX_CLIENTS = 3;
 
 // For pseudo-PGNs that originate from the gateway (not from N2K bus)
 static const uint8_t SRC_GATEWAY = 0xFF;
+
+// -------- Connect pause --------
+// When a new BLE client connects, suppress all outbound notifications for this
+// long so the client can complete service discovery and characteristic
+// subscription without being flooded by the notify queue. This does NOT gate
+// the CAN/TWAI drain loop — frames continue to be received and fast-packets
+// continue to be reassembled. Only the BLE notify path is paused.
+static const uint32_t CONNECT_PAUSE_MS         = 15000;
+static uint32_t       gConnectingPauseUntilMs = 0;
+
+static inline bool isConnectPaused(uint32_t nowMs) {
+  return nowMs < gConnectingPauseUntilMs;
+}
 
 // -------- Debug counters --------
 static uint32_t gCanFramesRx        = 0;
@@ -320,6 +333,12 @@ public:
                   (unsigned)s->getConnectedCount());
 
     beepOnBleConnect();
+
+    // Suppress all outbound notifications so the new client can complete
+    // service discovery and subscription setup without notify-queue pressure.
+    gConnectingPauseUntilMs = millis() + CONNECT_PAUSE_MS;
+    Serial.printf("CONNECT PAUSE: notifications paused for %lu ms\n",
+                  (unsigned long)CONNECT_PAUSE_MS);
 
     // Connection params: min/max interval are in 1.25ms units, timeout in 10ms units.
     s->updateConnParams(ci.getConnHandle(),
@@ -713,6 +732,12 @@ static inline uint64_t pgnSrcKey(uint32_t pgn, uint8_t src) {
 static void notifyPGN(uint32_t pgn, uint8_t src, const uint8_t* payload, size_t len, bool is_ais) {
   gBleNotifyAttempts++;
 
+  // Suppress notifications while a client is connecting / doing service discovery.
+  if (isConnectPaused(millis())) {
+    gBleNotifyThrottled++;
+    return;
+  }
+
   auto it = gCharByPGN.find(pgn);
   if (it == gCharByPGN.end() || it->second == nullptr) {
     gBleNotifyNoChar++;
@@ -845,7 +870,9 @@ void loop() {
 
   // Notify RSSI characteristic every second, silently
   static uint32_t lastRSSINotify = 0;
-  if (gSrv && gSrv->getConnectedCount() > 0 && now - lastRSSINotify >= 1000) {
+  if (gSrv && gSrv->getConnectedCount() > 0
+      && !isConnectPaused(now)
+      && now - lastRSSINotify >= 1000) {
     lastRSSINotify = now;
     int8_t rssi = getClientRSSI();
     if (rssi != -128) {

@@ -825,7 +825,7 @@ static std::vector<uint8_t> buildAtoN(uint32_t mmsi, double latDeg, double lonDe
   appendFixedText(p, "MONTEREY AtoN", 20); appendU8(p, 0x00);
   return p;
 }
-
+                 
 static std::vector<uint8_t> buildAISUtcDate(uint32_t mmsi) {
   std::vector<uint8_t> p;
   appendU8(p, 0x00); appendU32LE(p, mmsi);
